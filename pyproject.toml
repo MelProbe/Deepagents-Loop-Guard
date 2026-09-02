@@ -1,0 +1,27 @@
+# Local regression-test scaffold only. The middleware is intended to be copied into
+# an existing application; this project does not need to be packaged or installed in
+# production.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deepagents-loop-guard"
+version = "0.1.0"
+description = "Regression-test scaffold for a drop-in Deep Agents tool-call middleware"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "deepagents>=0.7,<1",
+    "langchain>=1.3.14,<2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deepagents_loop_guard"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -39,13 +39,56 @@ def completed(call_id: str, output: str, *, name: str = "read_file", args=None):
     ]
 
 
-def request(tool_call: dict, messages: list) -> ToolCallRequest:
+def request(
+    tool_call: dict,
+    messages: list,
+    *,
+    current_batch: list[dict] | None = None,
+) -> ToolCallRequest:
     return ToolCallRequest(
         tool_call=tool_call,
         tool=None,
-        state={"messages": [*messages, AIMessage(content="", tool_calls=[tool_call])]},
+        state={
+            "messages": [
+                *messages,
+                AIMessage(content="", tool_calls=current_batch or [tool_call]),
+            ]
+        },
         runtime=None,
     )
+
+
+def completed_parallel_batch(
+    batch_number: int,
+    *,
+    a_output: str = "same-a",
+    b_output: str = "same-b",
+):
+    a = call(
+        f"a-{batch_number}",
+        name="read_file",
+        args={"path": "src/A.java"},
+    )
+    b = call(
+        f"b-{batch_number}",
+        name="git_log",
+        args={"path": "src/B.java"},
+    )
+    return [
+        AIMessage(content="", tool_calls=[a, b]),
+        ToolMessage(
+            content=a_output,
+            tool_call_id=a["id"],
+            name=a["name"],
+            status="success",
+        ),
+        ToolMessage(
+            content=b_output,
+            tool_call_id=b["id"],
+            name=b["name"],
+            status="success",
+        ),
+    ]
 
 
 def test_signature_is_stable_across_dictionary_order():
@@ -81,6 +124,57 @@ def test_third_identical_outcome_is_blocked_without_executing_tool():
     assert isinstance(result, ToolMessage)
     assert result.status == "error"
     assert result.content.startswith("[LOOP_GUARD_BLOCKED")
+
+
+def test_third_repeated_parallel_batch_blocks_each_tool_lane():
+    middleware = RepeatedToolCallMiddleware(repeat_threshold=3)
+    messages = [*completed_parallel_batch(1), *completed_parallel_batch(2)]
+    current_batch = [
+        call("a-3", name="read_file", args={"path": "src/A.java"}),
+        call("b-3", name="git_log", args={"path": "src/B.java"}),
+    ]
+    executed: list[str] = []
+
+    def handler(tool_request):
+        executed.append(tool_request.tool_call["name"])
+        return ToolMessage(
+            content="ran",
+            tool_call_id=tool_request.tool_call["id"],
+        )
+
+    results = [
+        middleware.wrap_tool_call(
+            request(tool_call, messages, current_batch=current_batch),
+            handler,
+        )
+        for tool_call in current_batch
+    ]
+
+    assert executed == []
+    assert all(isinstance(result, ToolMessage) for result in results)
+    assert all(result.content.startswith("[LOOP_GUARD_BLOCKED") for result in results)
+
+
+def test_parallel_sibling_does_not_hide_repeated_tool_with_unchanged_output():
+    middleware = RepeatedToolCallMiddleware(repeat_threshold=3)
+    messages = [
+        *completed_parallel_batch(1, b_output="b-v1"),
+        *completed_parallel_batch(2, b_output="b-v2"),
+    ]
+    a = call("a-3", name="read_file", args={"path": "src/A.java"})
+    b = call("b-3", name="git_log", args={"path": "src/B.java"})
+
+    a_result = middleware.wrap_tool_call(
+        request(a, messages, current_batch=[b, a]),
+        lambda _request: pytest.fail("unchanged A must be blocked"),
+    )
+    b_result = middleware.wrap_tool_call(
+        request(b, messages, current_batch=[b, a]),
+        lambda _request: ToolMessage(content="b-v3", tool_call_id=b["id"]),
+    )
+
+    assert a_result.status == "error"
+    assert b_result.content == "b-v3"
 
 
 def test_changed_output_is_treated_as_progress():
@@ -194,7 +288,7 @@ def test_create_deep_agent_integration_stops_repeated_tool_loop():
 
     @tool
     def inspect_java(path: str) -> str:
-        """Read a Java source file for test generation."""
+        """테스트 생성을 위해 Java 소스 파일을 읽습니다."""
         executions.append(path)
         return "unchanged source"
 
@@ -224,6 +318,59 @@ def test_create_deep_agent_integration_stops_repeated_tool_loop():
     )
 
     assert executions == ["src/Foo.java", "src/Foo.java"]
+    assert "Repeated tool-call loop detected" in result["messages"][-1].content
+
+
+def test_create_deep_agent_integration_stops_parallel_tool_loop():
+    executions: list[tuple[str, str]] = []
+
+    @tool
+    def inspect_java(path: str) -> str:
+        """테스트 생성을 위해 Java 소스 파일을 읽습니다."""
+        executions.append(("inspect_java", path))
+        return "unchanged source"
+
+    @tool
+    def inspect_git(path: str) -> str:
+        """Java 소스 파일의 git 이력을 읽습니다."""
+        executions.append(("inspect_git", path))
+        return "unchanged history"
+
+    class ToolAwareFakeModel(FakeMessagesListChatModel):
+        def bind_tools(self, tools, **kwargs):
+            del tools, kwargs
+            return self
+
+    responses = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                call(
+                    f"a-{index}",
+                    name="inspect_java",
+                    args={"path": "src/Foo.java"},
+                ),
+                call(
+                    f"b-{index}",
+                    name="inspect_git",
+                    args={"path": "src/Foo.java"},
+                ),
+            ],
+        )
+        for index in range(1, 5)
+    ]
+    agent = create_deep_agent(
+        model=ToolAwareFakeModel(responses=responses),
+        tools=[inspect_java, inspect_git],
+        middleware=[RepeatedToolCallMiddleware(repeat_threshold=3)],
+    )
+
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": "Inspect source and git repeatedly"}]}
+    )
+
+    assert executions.count(("inspect_java", "src/Foo.java")) == 2
+    assert executions.count(("inspect_git", "src/Foo.java")) == 2
     assert "Repeated tool-call loop detected" in result["messages"][-1].content
 
 

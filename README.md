@@ -13,8 +13,19 @@
    `LOOP_GUARD_BLOCKED` ToolMessage를 모델에 반환합니다.
 3. 모델이 경고를 무시하고 바로 같은 호출을 다시 요청하면 해당 agent run을
    종료합니다.
-4. 서로 다른 인자, 서로 다른 출력, 중간의 다른 도구 호출은 연속 반복을
-   초기화합니다.
+4. 인자나 출력이 달라지거나 다음 model turn에서 해당 도구가 호출되지 않으면
+   그 도구의 연속 반복 횟수를 초기화합니다.
+
+한 번의 model response가 여러 tool call을 병렬로 내보내는 경우에도 각 model
+turn을 하나의 batch로 묶어 추적합니다. 따라서 아래 두 형태를 모두 감지합니다.
+
+```text
+A, A, A
+A + B, A + B, A + B
+```
+
+병렬 batch 안의 B 호출은 A의 연속성을 끊지 않습니다. 대신 이전 model turn에서
+A가 빠지거나 A의 input/output이 바뀌면 A의 반복 횟수는 초기화됩니다.
 
 미들웨어 인스턴스에는 실행 중 카운터가 없습니다. 모든 판단은 graph state의
 message history에서 계산하므로 thread, 병렬 invocation 및 subagent 환경에서

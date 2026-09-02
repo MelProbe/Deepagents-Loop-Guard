@@ -1,8 +1,8 @@
-"""Middleware that stops repeated, non-progressing tool calls.
+"""진전 없이 반복되는 도구 호출을 중단하는 미들웨어입니다.
 
-The middleware instance deliberately stores configuration only. Runtime decisions are
-derived from the graph's message history so one instance is safe to reuse across
-threads and concurrent invocations.
+미들웨어 인스턴스에는 의도적으로 설정값만 저장합니다. 실행 중 판단은 그래프의
+메시지 이력에서 계산하므로 하나의 인스턴스를 여러 스레드와 동시 호출에서
+안전하게 재사용할 수 있습니다.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ _HARD_STOP_MARKER = "[LOOP_GUARD_HARD_STOP"
 
 
 def _json_default(value: Any) -> Any:
-    """Convert common non-JSON values into deterministic representations."""
+    """자주 사용되는 비 JSON 값을 항상 동일한 형태로 변환합니다."""
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
     if isinstance(value, (set, frozenset)):
@@ -66,7 +66,7 @@ def canonical_tool_signature(
     *,
     ignored_argument_keys: Collection[str] = (),
 ) -> str:
-    """Return a stable SHA-256 signature for a tool name and its arguments."""
+    """도구 이름과 인자로부터 일관된 SHA-256 시그니처를 생성합니다."""
     ignored = frozenset(ignored_argument_keys)
     normalized_args = _drop_ignored_keys(arguments or {}, ignored)
     payload = _canonical_json({"name": tool_name, "args": normalized_args})
@@ -90,23 +90,33 @@ class _CompletedCall:
     soft_blocked: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _CompletedBatch:
+    """하나의 모델 응답에서 함께 생성된 도구 호출 묶음입니다."""
+
+    calls: tuple[_CompletedCall, ...]
+
+
 def _tool_calls(message: AIMessage) -> Sequence[Mapping[str, Any]]:
     return message.tool_calls or ()
 
 
 class RepeatedToolCallMiddleware(AgentMiddleware):
-    """Block an exact tool call when prior identical calls made no progress.
+    """이전의 동일한 호출에서 진전이 없으면 같은 도구 호출을 차단합니다.
 
-    ``repeat_threshold=3`` means:
+    ``repeat_threshold=3``의 동작은 다음과 같습니다.
 
-    * execute attempts one and two normally;
-    * if both produced the same output, return an artificial error ToolMessage for
-      attempt three without invoking the tool;
-    * if the model immediately ignores that message and asks for the same call again,
-      terminate the current agent run gracefully.
+    * 첫 번째와 두 번째 호출은 정상적으로 실행합니다.
+    * 두 호출의 출력까지 같으면 세 번째 호출은 실제 도구를 실행하지 않고
+      오류 상태의 인위적인 ``ToolMessage``를 반환합니다.
+    * 모델이 이 메시지를 무시하고 즉시 같은 호출을 다시 요청하면 현재 agent
+      run을 안전하게 종료합니다.
 
-    Different arguments, a different output, or any intervening completed tool call
-    resets the consecutive-repeat sequence.
+    하나의 모델 응답에서 함께 생성된 호출은 한 batch로 추적합니다. 예를 들어
+    ``A + B`` 병렬 batch가 반복되면 A와 B의 반복 횟수가 각각 증가하며, 함께
+    실행된 B의 결과가 A의 연속성을 끊지 않습니다. 다음 모델 turn에서 A가
+    호출되지 않거나 A의 인자 또는 출력이 바뀌면 A의 연속 반복 횟수를
+    초기화합니다.
     """
 
     def __init__(
@@ -156,73 +166,90 @@ class RepeatedToolCallMiddleware(AgentMiddleware):
             ignored_argument_keys=self.ignored_argument_keys.get(name, ()),
         )
 
-    def _completed_calls(self, messages: Sequence[BaseMessage]) -> list[_CompletedCall]:
-        pending: dict[str, tuple[str, str]] = {}
-        completed: list[_CompletedCall] = []
+    def _completed_batches(self, messages: Sequence[BaseMessage]) -> list[_CompletedBatch]:
+        batch_calls: list[list[tuple[str, str, str]]] = []
+        batch_results: list[dict[str, ToolMessage]] = []
+        pending_batch_by_call_id: dict[str, int] = {}
 
         for message in messages[-self.message_scan_limit :]:
             if isinstance(message, AIMessage):
+                definitions: list[tuple[str, str, str]] = []
                 for call in _tool_calls(message):
                     call_id = str(call.get("id", ""))
                     if call_id:
-                        pending[call_id] = (
-                            str(call.get("name", "")),
-                            self._signature(call),
+                        definitions.append(
+                            (
+                                call_id,
+                                str(call.get("name", "")),
+                                self._signature(call),
+                            )
                         )
+                if definitions:
+                    batch_index = len(batch_calls)
+                    batch_calls.append(definitions)
+                    batch_results.append({})
+                    for call_id, _, _ in definitions:
+                        pending_batch_by_call_id[call_id] = batch_index
                 continue
 
             if not isinstance(message, ToolMessage):
                 continue
 
             call_id = str(message.tool_call_id)
-            pending_call = pending.get(call_id)
-            if pending_call is None:
-                tool_name = str(getattr(message, "name", "") or "")
-                if not tool_name:
-                    continue
-                signature = ""
-            else:
-                tool_name, signature = pending_call
+            batch_index = pending_batch_by_call_id.get(call_id)
+            if batch_index is not None:
+                batch_results[batch_index][call_id] = message
 
-            content = message.content if isinstance(message.content, str) else ""
-            completed.append(
-                _CompletedCall(
-                    tool_call_id=call_id,
-                    tool_name=tool_name,
-                    signature=signature,
-                    output_digest=_output_digest(message),
-                    soft_blocked=content.startswith(_SOFT_BLOCK_MARKER),
+        completed: list[_CompletedBatch] = []
+        for definitions, results in zip(batch_calls, batch_results, strict=True):
+            if not definitions or any(call_id not in results for call_id, _, _ in definitions):
+                continue
+
+            calls: list[_CompletedCall] = []
+            for call_id, tool_name, signature in definitions:
+                message = results[call_id]
+                content = message.content if isinstance(message.content, str) else ""
+                calls.append(
+                    _CompletedCall(
+                        tool_call_id=call_id,
+                        tool_name=tool_name,
+                        signature=signature,
+                        output_digest=_output_digest(message),
+                        soft_blocked=content.startswith(_SOFT_BLOCK_MARKER),
+                    )
                 )
-            )
+            completed.append(_CompletedBatch(calls=tuple(calls)))
 
         return completed
 
     @staticmethod
     def _consecutive_identical_outcomes(
-        completed: Sequence[_CompletedCall],
+        completed: Sequence[_CompletedBatch],
         signature: str,
     ) -> int:
-        matches: list[_CompletedCall] = []
-        for call in reversed(completed):
-            if call.signature != signature or call.soft_blocked:
+        expected_outputs: tuple[str, ...] | None = None
+        count = 0
+        for batch in reversed(completed):
+            matching_calls = [call for call in batch.calls if call.signature == signature]
+            if not matching_calls or any(call.soft_blocked for call in matching_calls):
                 break
-            matches.append(call)
-
-        if not matches:
-            return 0
-        first_output = matches[0].output_digest
-        if any(call.output_digest != first_output for call in matches[1:]):
-            return 0
-        return len(matches)
+            outputs = tuple(sorted(call.output_digest for call in matching_calls))
+            if expected_outputs is None:
+                expected_outputs = outputs
+            elif outputs != expected_outputs:
+                break
+            count += 1
+        return count
 
     @staticmethod
     def _consecutive_soft_blocks(
-        completed: Sequence[_CompletedCall],
+        completed: Sequence[_CompletedBatch],
         signature: str,
     ) -> int:
         count = 0
-        for call in reversed(completed):
-            if call.signature != signature or not call.soft_blocked:
+        for batch in reversed(completed):
+            matching_calls = [call for call in batch.calls if call.signature == signature]
+            if not matching_calls or not all(call.soft_blocked for call in matching_calls):
                 break
             count += 1
         return count
@@ -236,8 +263,12 @@ class RepeatedToolCallMiddleware(AgentMiddleware):
         prior_soft_blocks: int,
     ) -> ToolMessage:
         tool_call = request.tool_call
-        attempt = prior_identical_outcomes + prior_soft_blocks + 1
         threshold = self._threshold_for(str(tool_call["name"]))
+        attempt = (
+            threshold + prior_soft_blocks
+            if prior_soft_blocks
+            else prior_identical_outcomes + 1
+        )
         return ToolMessage(
             content=(
                 f"{_SOFT_BLOCK_MARKER} signature={signature[:16]}] "
@@ -259,7 +290,7 @@ class RepeatedToolCallMiddleware(AgentMiddleware):
         tool_call = request.tool_call
         tool_name = str(tool_call["name"])
         signature = self._signature(tool_call)
-        completed = self._completed_calls(request.state.get("messages", []))
+        completed = self._completed_batches(request.state.get("messages", []))
         prior_outcomes = self._consecutive_identical_outcomes(completed, signature)
         prior_blocks = self._consecutive_soft_blocks(completed, signature)
         threshold = self._threshold_for(tool_name)
@@ -312,7 +343,7 @@ class RepeatedToolCallMiddleware(AgentMiddleware):
 
     @hook_config(can_jump_to=["end"])
     def after_model(self, state: Mapping[str, Any], runtime: Any) -> dict[str, Any] | None:
-        """End the run if the model repeats a call after one or more soft blocks."""
+        """모델이 1차 차단 이후에도 같은 호출을 반복하면 현재 실행을 종료합니다."""
         del runtime
         messages = state.get("messages", [])
         if not messages:
@@ -325,7 +356,7 @@ class RepeatedToolCallMiddleware(AgentMiddleware):
         if last_ai is None or not last_ai.tool_calls:
             return None
 
-        completed = self._completed_calls(messages)
+        completed = self._completed_batches(messages)
         offending_call: Mapping[str, Any] | None = None
         offending_signature = ""
         prior_blocks = 0
@@ -399,10 +430,11 @@ def build_agent_guardrails(
     excluded_tools: Collection[str] = (),
     ignored_argument_keys: Mapping[str, Collection[str]] | None = None,
 ) -> list[AgentMiddleware]:
-    """Build the repeat guard plus optional total call circuit breakers.
+    """반복 호출 보호 로직과 선택적인 전체 호출 제한 미들웨어를 구성합니다.
 
-    Set ``tool_run_limit`` or ``model_run_limit`` to ``None`` to omit the
-    corresponding limiter. A value of ``0`` remains a real zero-call limit.
+    ``tool_run_limit`` 또는 ``model_run_limit``을 ``None``으로 지정하면 해당
+    제한 미들웨어를 추가하지 않습니다. ``0``은 비활성화가 아니라 실제 허용 횟수
+    0회를 의미합니다.
     """
     guardrails: list[AgentMiddleware] = [
         RepeatedToolCallMiddleware(
